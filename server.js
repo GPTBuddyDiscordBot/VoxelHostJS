@@ -8,13 +8,56 @@ try { const c = JSON.parse(fs.readFileSync(path.join(__dirname, 'config.json'), 
 
 const rooms = new Map();
 
+// ─── Bans (persisted to bans.json) ───
+const BANS_PATH = path.join(__dirname, 'bans.json');
+const bans = new Map();
+function loadBans() {
+  try {
+    const raw = fs.readFileSync(BANS_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object') {
+      for (const [deviceId, entry] of Object.entries(parsed)) {
+        if (entry && typeof entry === 'object') {
+          bans.set(deviceId, { username: String(entry.username || ''), until: entry.until === null ? null : Number(entry.until) || 0, reason: String(entry.reason || 'Banned') });
+        }
+      }
+    }
+    const now = Date.now();
+    let purged = 0;
+    for (const [id, b] of bans.entries()) {
+      if (b.until !== null && b.until < now) { bans.delete(id); purged++; }
+    }
+    if (purged > 0) saveBans();
+    console.log('[bans] Loaded ' + bans.size + ' ban(s)' + (purged ? ' (purged ' + purged + ' expired)' : ''));
+  } catch (err) {
+    if (err.code !== 'ENOENT') console.warn('[bans] Could not read bans.json:', err.message);
+  }
+}
+function saveBans() {
+  try {
+    const obj = {};
+    for (const [id, b] of bans.entries()) { obj[id] = { username: b.username, until: b.until, reason: b.reason }; }
+    fs.writeFileSync(BANS_PATH, JSON.stringify(obj, null, 2));
+  } catch (err) { console.warn('[bans] Could not write bans.json:', err.message); }
+}
+function isBanned(deviceId) {
+  if (!deviceId) return null;
+  const b = bans.get(deviceId);
+  if (!b) return null;
+  if (b.until !== null && b.until < Date.now()) { bans.delete(deviceId); saveBans(); return null; }
+  return b;
+}
+loadBans();
+
 function genId() { return Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4); }
 function genRoomId() { return 'r_' + Math.random().toString(36).slice(2, 10); }
 
 function getOrCreateRoom(roomId) {
   if (!rooms.has(roomId)) {
-    rooms.set(roomId, { players: new Map(), created: Date.now(), name: 'Server ' + roomId.slice(0, 6), motd: config.motd, maxPlayers: config.maxPlayers });
-    console.log('[room] Created ' + roomId + ' (' + rooms.size + ' total)');
+    // Each room gets a UNIQUE world seed based on its room ID.
+    // This ensures no two servers generate the same terrain.
+    rooms.set(roomId, { players: new Map(), created: Date.now(), name: 'Server ' + roomId.slice(0, 6), motd: config.motd, maxPlayers: config.maxPlayers, worldSeed: roomId });
+    console.log('[room] Created ' + roomId + ' seed=' + roomId + ' (' + rooms.size + ' total)');
   }
   return rooms.get(roomId);
 }
@@ -47,7 +90,6 @@ function roomSnapshot(room) {
   }));
 }
 
-// Find a player by username (case-insensitive) within a room
 function findPlayerByName(room, name) {
   const lower = String(name || '').toLowerCase();
   for (const p of room.players.values()) {
@@ -64,6 +106,7 @@ const httpServer = http.createServer((req, res) => {
 
   const url = new URL(req.url, 'http://localhost');
 
+  // POST /create-room — create a new room with unique seed
   if (req.method === 'POST' && url.pathname === '/create-room') {
     let body = '';
     req.on('data', c => body += c);
@@ -76,14 +119,16 @@ const httpServer = http.createServer((req, res) => {
         room.motd = String(data.motd || data.name || 'VoxelCraft Server').slice(0, 100);
         room.maxPlayers = Math.min(50, Math.max(1, Number(data.maxPlayers) || 20));
         room.creatorPw = String(data.adminPassword || config.adminPassword);
-        console.log('[create] ' + roomId + ' name="' + room.name + '" pw="' + room.creatorPw + '"');
+        // worldSeed is already set to roomId in getOrCreateRoom — unique per server!
+        console.log('[create] ' + roomId + ' name="' + room.name + '" seed="' + room.worldSeed + '" pw="' + room.creatorPw + '"');
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ roomId, name: room.name, motd: room.motd, maxPlayers: room.maxPlayers, worldSeed: config.worldSeed, pvp: config.pvp }));
+        res.end(JSON.stringify({ roomId, name: room.name, motd: room.motd, maxPlayers: room.maxPlayers, worldSeed: room.worldSeed, pvp: config.pvp }));
       } catch (e) { res.writeHead(400); res.end('{"error":"bad request"}'); }
     });
     return;
   }
 
+  // POST /delete-room — delete a room (requires admin password)
   if (req.method === 'POST' && url.pathname === '/delete-room') {
     let body = '';
     req.on('data', c => body += c);
@@ -105,26 +150,28 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
+  // GET /status — server or room status
   if (req.method === 'GET' && url.pathname === '/status') {
     const roomId = url.searchParams.get('room');
     if (roomId && rooms.has(roomId)) {
       const room = rooms.get(roomId);
       const players = [...room.players.values()].filter(p => !p.isAdmin).map(p => p.username);
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ online: true, roomId, name: room.name, motd: room.motd, playerCount: players.length, maxPlayers: room.maxPlayers, pvp: config.pvp, worldSeed: config.worldSeed, mods: config.mods, players, created: room.created }));
+      res.end(JSON.stringify({ online: true, roomId, name: room.name, motd: room.motd, playerCount: players.length, maxPlayers: room.maxPlayers, pvp: config.pvp, worldSeed: room.worldSeed || config.worldSeed, mods: config.mods, players, created: room.created }));
       return;
     }
     let total = 0; const roomList = [];
     for (const [id, r] of rooms) {
       const count = [...r.players.values()].filter(p => !p.isAdmin).length;
       total += count;
-      roomList.push({ roomId: id, name: r.name, motd: r.motd, playerCount: count, maxPlayers: r.maxPlayers, created: r.created });
+      roomList.push({ roomId: id, name: r.name, motd: r.motd, playerCount: count, maxPlayers: r.maxPlayers, created: r.created, worldSeed: r.worldSeed });
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ online: true, totalRooms: rooms.size, totalPlayers: total, rooms: roomList }));
     return;
   }
 
+  // GET /rooms — list all rooms
   if (req.method === 'GET' && url.pathname === '/rooms') {
     const roomList = [];
     for (const [id, r] of rooms) {
@@ -166,6 +213,18 @@ wss.on('connection', (ws, req) => {
       case 'set_username': {
         const name = String(msg.username || 'Player').slice(0, 32) || 'Player';
         p.deviceId = String(msg.deviceId || '').slice(0, 128);
+
+        // ─── Ban check by deviceId (NOT username) ───
+        const ban = isBanned(p.deviceId);
+        if (ban) {
+          const untilStr = ban.until === null ? 'permanently' : 'until ' + new Date(ban.until).toLocaleString();
+          try { ws.send(JSON.stringify({ type: 'banned', data: { msg: ban.reason + ' (' + untilStr + ')', until: ban.until } })); } catch {}
+          console.log('[ban] Rejected ' + name + ' (device=' + p.deviceId + ') — banned ' + untilStr);
+          room.players.delete(ws);
+          try { ws.close(1008, 'Banned'); } catch {}
+          return;
+        }
+
         p.mcUsername = String(msg.mcUsername || '').slice(0, 32);
         const lower = name.toLowerCase();
         for (const o of room.players.values()) {
@@ -176,7 +235,7 @@ wss.on('connection', (ws, req) => {
           }
         }
         p.username = name;
-        ws.send(JSON.stringify({ type: 'joined', data: { id: p.id, players: roomSnapshot(room), serverMods: config.mods, roomId: p.roomId, roomName: room.name } }));
+        ws.send(JSON.stringify({ type: 'joined', data: { id: p.id, players: roomSnapshot(room), serverMods: config.mods, roomId: p.roomId, roomName: room.name, worldSeed: room.worldSeed } }));
         broadcastRoom(room, { type: 'player_joined', data: { id: p.id, username: p.username, mcUsername: p.mcUsername, x: p.x, y: p.y, z: p.z, yaw: p.yaw, heldItemId: p.heldItemId, armor: p.armor, isOwner: false } }, ws);
         console.log('[join] ' + p.username + ' -> ' + roomId + ' (' + room.players.size + ')');
         break;
@@ -214,12 +273,11 @@ wss.on('connection', (ws, req) => {
           case 'list': {
             const l = ['Players in ' + roomId + ' (' + room.players.size + '/' + room.maxPlayers + ')'];
             let i = 1;
-            for (const pp of room.players.values()) { if (pp.isAdmin) continue; l.push('  ' + (i++) + '. ' + pp.username + ' (' + pp.x.toFixed(0) + ',' + pp.y.toFixed(0) + ',' + pp.z.toFixed(0) + ')'); }
+            for (const pp of room.players.values()) { if (pp.isAdmin) continue; l.push('  ' + (i++) + '. ' + pp.username + ' (device=' + (pp.deviceId||'-') + ') (' + pp.x.toFixed(0) + ',' + pp.y.toFixed(0) + ',' + pp.z.toFixed(0) + ')'); }
             result = l.join('\n');
             break;
           }
           case 'kick': {
-            // /kick <user> [reason...]
             const targetName = args[0];
             if (!targetName) { result = 'Usage: /kick <username> [reason]'; break; }
             const target = findPlayerByName(room, targetName);
@@ -234,28 +292,49 @@ wss.on('connection', (ws, req) => {
             break;
           }
           case 'ban': {
-            // /ban <user> [days] [reason...]
             const targetName = args[0];
             if (!targetName) { result = 'Usage: /ban <username> [days] [reason]'; break; }
             const target = findPlayerByName(room, targetName);
             if (!target) { result = 'Player "' + targetName + '" is not currently connected.'; break; }
             if (!target.deviceId) { result = 'Player "' + target.username + '" has no deviceId — cannot ban.'; break; }
-            // Parse days (optional, second arg if it's a number)
             let days = 0; let reasonStart = 1;
-            if (args[1] !== undefined && !isNaN(Number(args[1]))) {
-              days = Math.max(0, Number(args[1]));
-              reasonStart = 2;
-            }
+            if (args[1] !== undefined && !isNaN(Number(args[1]))) { days = Math.max(0, Number(args[1])); reasonStart = 2; }
             const reason = args.slice(reasonStart).join(' ') || 'Banned by admin';
             const until = days > 0 ? Date.now() + days * 86400000 : null;
-            // Store ban (would need a bans map — for now just kick with ban message)
+            // ─── Ban by deviceId (persists to bans.json) ───
+            bans.set(target.deviceId, { username: target.username, until: until, reason: reason });
+            saveBans();
             try { target.ws.send(JSON.stringify({ type: 'banned', data: { msg: reason, until: until } })); } catch {}
             try { target.ws.close(1008, 'Banned'); } catch {}
             room.players.delete(target.ws);
             broadcastRoom(room, { type: 'player_left', data: { id: target.id } });
             const untilStr = until ? 'until ' + new Date(until).toISOString() : 'permanently';
-            result = 'Banned ' + target.username + ' ' + untilStr + ' (reason: ' + reason + ')';
-            console.log('[ban] ' + target.username + ' by admin ' + untilStr + ' (reason: ' + reason + ')');
+            result = 'Banned ' + target.username + ' ' + untilStr + ' (reason: ' + reason + ') [deviceId: ' + target.deviceId + ']';
+            console.log('[ban] ' + target.username + ' by admin ' + untilStr + ' (reason: ' + reason + ') device=' + target.deviceId);
+            break;
+          }
+          case 'unban': {
+            // /unban <username> — removes all bans matching that username
+            const targetName = args[0];
+            if (!targetName) { result = 'Usage: /unban <username>'; break; }
+            const lower = targetName.toLowerCase();
+            let removed = 0;
+            for (const [id, b] of bans.entries()) {
+              if (b.username && b.username.toLowerCase() === lower) { bans.delete(id); removed++; }
+            }
+            if (removed > 0) { saveBans(); result = 'Removed ' + removed + ' ban(s) for "' + targetName + '".'; }
+            else { result = 'No ban found for "' + targetName + '".'; }
+            break;
+          }
+          case 'bans': {
+            if (bans.size === 0) { result = 'No active bans.'; break; }
+            const l = ['--- Active bans (' + bans.size + ') ---'];
+            let i = 1;
+            for (const [id, b] of bans.entries()) {
+              const exp = b.until === null ? 'permanent' : new Date(b.until).toISOString();
+              l.push('  ' + (i++) + '. ' + b.username + '  expires=' + exp + '  reason=' + b.reason);
+            }
+            result = l.join('\n');
             break;
           }
           case 'say': {
@@ -266,11 +345,11 @@ wss.on('connection', (ws, req) => {
             break;
           }
           case 'info': {
-            result = 'Room: ' + roomId + '\nName: ' + room.name + '\nPlayers: ' + room.players.size + '/' + room.maxPlayers + '\nMOTD: ' + room.motd;
+            result = 'Room: ' + roomId + '\nName: ' + room.name + '\nSeed: ' + room.worldSeed + '\nPlayers: ' + room.players.size + '/' + room.maxPlayers + '\nMOTD: ' + room.motd + '\nBans: ' + bans.size;
             break;
           }
           case 'help': {
-            result = 'Commands:\n  /list                          — list players\n  /kick <user> [reason]          — kick with reason\n  /ban <user> [days] [reason]    — ban (0=perm, days optional)\n  /say <message>                 — broadcast\n  /info                          — server info\n  /help                          — this help';
+            result = 'Commands:\n  /list                          — list players\n  /kick <user> [reason]          — kick with reason\n  /ban <user> [days] [reason]    — ban by deviceId (0=perm)\n  /unban <user>                  — remove ban\n  /bans                          — list active bans\n  /say <message>                 — broadcast\n  /info                          — server info\n  /help                          — this help';
             break;
           }
           default: result = 'Unknown: /' + cmd + '. Try /help';
@@ -298,5 +377,7 @@ httpServer.listen(PORT, () => {
   console.log('============================================');
   console.log('  Port: ' + PORT);
   console.log('  Admin PW: ' + config.adminPassword);
+  console.log('  Unique seeds: ENABLED (per room)');
+  console.log('  Ban system: deviceId-based (bans.json)');
   console.log('============================================\n');
 });
