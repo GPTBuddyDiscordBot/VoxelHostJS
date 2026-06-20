@@ -22,7 +22,6 @@ function getOrCreateRoom(roomId) {
 function deleteRoom(roomId) {
   const room = rooms.get(roomId);
   if (!room) return false;
-  // Kick all players in the room
   for (const [ws, p] of room.players) {
     try { ws.send(JSON.stringify({ type: 'disconnect', reason: 'Server deleted' })); } catch {}
     try { ws.close(1001); } catch {}
@@ -56,7 +55,6 @@ const httpServer = http.createServer((req, res) => {
 
   const url = new URL(req.url, 'http://localhost');
 
-  // POST /create-room — create a new room
   if (req.method === 'POST' && url.pathname === '/create-room') {
     let body = '';
     req.on('data', c => body += c);
@@ -68,8 +66,8 @@ const httpServer = http.createServer((req, res) => {
         room.name = String(data.name || 'My Server').slice(0, 50);
         room.motd = String(data.motd || data.name || 'VoxelCraft Server').slice(0, 100);
         room.maxPlayers = Math.min(50, Math.max(1, Number(data.maxPlayers) || 20));
-        room.creatorPw = String(data.adminPassword || config.adminPassword); // store creator's password for deletion auth
-        console.log('[create] ' + roomId + ' name="' + room.name + '"');
+        room.creatorPw = String(data.adminPassword || config.adminPassword);
+        console.log('[create] ' + roomId + ' name="' + room.name + '" pw="' + room.creatorPw + '"');
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ roomId, name: room.name, motd: room.motd, maxPlayers: room.maxPlayers, worldSeed: config.worldSeed, pvp: config.pvp }));
       } catch (e) { res.writeHead(400); res.end('{"error":"bad request"}'); }
@@ -77,7 +75,6 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
-  // POST /delete-room — delete a room (requires admin password)
   if (req.method === 'POST' && url.pathname === '/delete-room') {
     let body = '';
     req.on('data', c => body += c);
@@ -88,7 +85,6 @@ const httpServer = http.createServer((req, res) => {
         const password = String(data.password || '');
         const room = rooms.get(roomId);
         if (!room) { res.writeHead(404); res.end('{"error":"room not found"}'); return; }
-        // Check password: must match either the room creator's password OR the server admin password
         if (password !== config.adminPassword && password !== room.creatorPw) {
           res.writeHead(403); res.end('{"error":"wrong password"}'); return;
         }
@@ -100,7 +96,6 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
-  // GET /status — server or room status
   if (req.method === 'GET' && url.pathname === '/status') {
     const roomId = url.searchParams.get('room');
     if (roomId && rooms.has(roomId)) {
@@ -121,7 +116,6 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
-  // GET /rooms — list all rooms
   if (req.method === 'GET' && url.pathname === '/rooms') {
     const roomList = [];
     for (const [id, r] of rooms) {
@@ -192,19 +186,19 @@ wss.on('connection', (ws, req) => {
       case 'mods': { const m = msg.mods || {}; if (typeof m.sharks === 'boolean') config.mods.sharks = m.sharks; if (typeof m.skateboard === 'boolean') config.mods.skateboard = m.skateboard; broadcastRoom(room, { type: 'mod_sync', data: config.mods }); break; }
       case 'admin_auth': {
         const password = String(msg.password || '');
-        console.log('[admin] Auth attempt: password="' + password + '" expected="' + config.adminPassword + '"');
-        if (password === config.adminPassword && config.adminPassword) {
+        console.log('[admin] Auth attempt: password="' + password + '" roomPw="' + (room.creatorPw||'none') + '" globalPw="' + config.adminPassword + '"');
+        if ((password === config.adminPassword && config.adminPassword) || (room.creatorPw && password === room.creatorPw)) {
           p.isAdmin = true;
           try { ws.send(JSON.stringify({ type: 'admin_auth_result', success: true })); } catch {}
           console.log('[admin] SUCCESS from ' + p.ip);
         } else {
-          try { ws.send(JSON.stringify({ type: 'admin_auth_result', success: false, error: 'Wrong password (sent: ' + password + ')' })); } catch {}
+          try { ws.send(JSON.stringify({ type: 'admin_auth_result', success: false, error: 'Wrong password (you sent: ' + password + ')' })); } catch {}
           console.log('[admin] FAILED from ' + p.ip);
         }
         break;
       }
       case 'admin_command': {
-        if (!p.isAdmin) { try { ws.send(JSON.stringify({ type: 'admin_output', text: 'Not authenticated. Send admin_auth first.' })); } catch {} break; }
+        if (!p.isAdmin) { try { ws.send(JSON.stringify({ type: 'admin_output', text: 'Not authenticated.' })); } catch {} break; }
         const cmd = String(msg.command || '').toLowerCase(); const args = Array.isArray(msg.args) ? msg.args : [];
         let result = null;
         switch (cmd) {
