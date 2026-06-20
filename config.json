@@ -1,0 +1,12 @@
+{
+  "port": 0,
+  "maxPlayers": 20,
+  "worldSeed": "voxelhost",
+  "pvp": true,
+  "spawnProtection": true,
+  "adminPassword": "voxelcraft",
+  "mods": {
+    "sharks": false,
+    "skateboard": false
+  }
+}

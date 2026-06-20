@@ -1,0 +1,16 @@
+{
+  "name": "voxelhost-server",
+  "version": "1.0.0",
+  "description": "VoxelHost game server with room support",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
